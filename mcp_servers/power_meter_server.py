@@ -169,6 +169,24 @@ class _SimulatedPowerMeter:
         pass
 
 
+def _visa_clear_after_error(hw: _PowerMeterHW | _SimulatedPowerMeter) -> None:
+    """After a failed read/query, USBTMC can leave the interface busy; clear before next SCPI."""
+    if isinstance(hw, _PowerMeterHW):
+        try:
+            hw._inst.clear()
+        except Exception:
+            pass
+
+
+def _query_float_safe(hw: _PowerMeterHW | _SimulatedPowerMeter, cmd: str) -> Optional[float]:
+    """Parse ``float(hw.query(cmd))``; return ``None`` on timeout, empty reply, or parse error."""
+    try:
+        return float(hw.query(cmd))
+    except Exception:
+        _visa_clear_after_error(hw)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Module-level hardware initialisation (lazy, once)
 # ---------------------------------------------------------------------------
@@ -319,7 +337,8 @@ mcp = FastMCP(
         "Read the current configuration and connection state of the power meter. "
         "Returns: device identity string, wavelength_nm (operating wavelength for responsivity "
         "correction), auto_range (bool), range_upper_W (current range ceiling in W), "
-        "power_unit ('W' or 'DBM'), zero_offset_W (dark offset from last zero_power_meter call), "
+        "power_unit ('W' or 'DBM'), zero_offset_W (dark offset from last zero_power_meter call; "
+        "may be null if the firmware does not answer SENS:CORR:COLL:ZERO:MAG? or the query times out), "
         "avg_count (device-side averaging count), and simulate (true when running in stub mode). "
         "Call this first to verify the meter is ready before a calibration run."
     ),
@@ -331,7 +350,7 @@ def get_power_meter_status() -> dict:
     auto_range = hw.query("SENS:POW:DC:RANG:AUTO?") in ("1", "ON")
     range_upper_W = float(hw.query("SENS:POW:DC:RANG:UPP?"))
     power_unit = hw.query("SENS:POW:DC:UNIT?")
-    zero_offset_W = float(hw.query("SENS:CORR:COLL:ZERO:MAG?"))
+    zero_offset_W = _query_float_safe(hw, "SENS:CORR:COLL:ZERO:MAG?")
     avg_count = int(hw.query("SENS:AVG:CNT?"))
     return {
         "identity": idn,
@@ -432,12 +451,12 @@ def read_power_averaged(n_samples: int = 10, interval_ms: int = 100) -> dict:
 )
 def set_wavelength(wavelength_nm: float) -> dict:
     hw = _get_hw()
-    wavelength_m = wavelength_nm * 1e-9   # SCPI unit is metres
+    wavelength_m = float(wavelength_nm) * 1e-9   # SCPI unit is metres
     hw.write(f"SENS:CORR:WAV {wavelength_m:.6e}")
     # Read back to confirm what the device accepted (firmware may round)
     actual_m = float(hw.query("SENS:CORR:WAV?"))
     return {
-        "wavelength_nm": actual_m * 1e9,
+        "wavelength_nm": f"{actual_m :.3f} nm",
     }
 
 
@@ -454,7 +473,8 @@ def set_wavelength(wavelength_nm: float) -> dict:
         "that is subtracted from all subsequent readings. "
         "The function blocks until zeroing completes (polls SENS:CORR:COLL:ZERO:STAT? at "
         f"{int(_ZERO_POLL_INTERVAL_S * 1000)} ms intervals, timeout {int(_ZERO_TIMEOUT_S)} s). "
-        "Returns zero_offset_W (the measured dark offset in W) and elapsed_s. "
+        "Returns zero_offset_W (the measured dark offset in W when SENS:CORR:COLL:ZERO:MAG? "
+        "responds; otherwise null — zeroing may still have completed on the device) and elapsed_s. "
         "Raises an error if zeroing does not complete within the timeout."
     ),
 )
@@ -477,7 +497,7 @@ def zero_power_meter() -> dict:
             )
         time.sleep(_ZERO_POLL_INTERVAL_S)
 
-    zero_offset_W = float(hw.query("SENS:CORR:COLL:ZERO:MAG?"))
+    zero_offset_W = _query_float_safe(hw, "SENS:CORR:COLL:ZERO:MAG?")
     elapsed_s = time.time() - t_start
     return {
         "zero_offset_W": zero_offset_W,
